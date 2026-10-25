@@ -1,1 +1,7 @@
-binary,length,identity,threads,n_runs,median_time,mean_time,stdev_time,median_rss_kb
+binary,length,identity,threads,schedule_chunk,affinity,cpu_set,affinity_mask,n_runs,median_time,mean_time,stdev_time,median_rss_kb,median_l1_dcache_load_misses,median_instructions,median_cycles,median_ipc
+tiled_sw.exe,2000,0.95,1,1,unbound,,,3,0.23172900000099617,0.21832470000056978,0.028621558430449723,6372,,,,
+tiled_sw.exe,2000,0.95,2,1,unbound,,,3,0.11084999999911815,0.11136099999991227,0.004727060444113454,6420,,,,
+tiled_sw.exe,2000,0.95,4,1,unbound,,,3,0.08957790000022214,0.08818889999990158,0.009348216995537317,6588,,,,
+wfa_banded.exe,2000,0.95,1,1,unbound,,,3,0.10731119999945804,0.10485873333285174,0.010598099366640235,6408,,,,
+wfa_banded.exe,2000,0.95,2,1,unbound,,,3,0.06690299999900162,0.06561583333253414,0.007471078638867231,6492,,,,
+wfa_banded.exe,2000,0.95,4,1,unbound,,,3,0.04882089999955497,0.05636246666593555,0.021338159438711084,6296,,,,

@@ -1,8 +1,12 @@
+#if !defined(_WIN32) && !defined(_WIN64)
+#define _POSIX_C_SOURCE 200112L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <malloc.h>   // _aligned_malloc, _aligned_free
+#include <limits.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -11,11 +15,39 @@
 #if defined(_WIN32) || defined(_WIN64)
 #define WINDOWS 1
 #include <windows.h>
+#include <malloc.h>
 #else
 #define WINDOWS 0
 #include <time.h>
 #include <sys/time.h>
 #endif
+
+static void *aligned_allocate(size_t size, size_t alignment) {
+#if WINDOWS
+    return _aligned_malloc(size, alignment);
+#else
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
+    return ptr;
+#endif
+}
+
+static void aligned_release(void *ptr) {
+#if WINDOWS
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+static int parse_positive_int(const char *text, int *value) {
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (text == end || *end != '\0' || parsed < 1 || parsed > INT_MAX)
+        return 0;
+    *value = (int)parsed;
+    return 1;
+}
 
 // --------------------------------------------------------
 // High-resolution timer
@@ -195,13 +227,27 @@ static int smith_waterman_score_fast(
 }
 
 // --------------------------------------------------------
-// MAIN: automatic thread benchmarking
+// MAIN: one harness-controlled benchmark configuration
 // --------------------------------------------------------
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s pairs.fa\n", argv[0]);
+    int threads = 1;
+    int chunk_size = 1;
+    if (argc < 2 || argc > 4 ||
+        (argc >= 3 && !parse_positive_int(argv[2], &threads)) ||
+        (argc >= 4 && !parse_positive_int(argv[3], &chunk_size))) {
+        fprintf(stderr, "Usage: %s pairs.fa [threads [schedule_chunk]]\n", argv[0]);
         return 1;
     }
+
+#ifndef _OPENMP
+    if (threads > 1) {
+        fprintf(stderr, "This binary was built without OpenMP; rebuild with -fopenmp\n");
+        return 1;
+    }
+#else
+    omp_set_dynamic(0);
+    omp_set_num_threads(threads);
+#endif
 
     const char *pairs_file = argv[1];
 
@@ -222,71 +268,65 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int thread_list[] = {1, 2, 4, 8, 16};
-    int nconfigs = sizeof(thread_list) / sizeof(thread_list[0]);
-
-    printf("=== Tiled Smith-Waterman Auto Benchmark ===\n");
-    printf("Dataset: %s  (pairs=%d, max_len_B=%d)\n\n", pairs_file, npairs, max_m);
-
-    double baseline_time = 0.0;
-
-    for (int c = 0; c < nconfigs; ++c) {
-        int threads = thread_list[c];
+    size_t row_capacity = ((size_t)max_m + 1 + 15) / 16 * 16;
+    long long score_sum = 0;
+    int allocation_failed = 0;
+    double t0 = walltime_seconds();
 
 #ifdef _OPENMP
-        omp_set_num_threads(threads);
-#endif
-
-        long long score_sum = 0;
-        double t0 = walltime_seconds();
-
-#ifdef _OPENMP
-#pragma omp parallel reduction(+:score_sum)
+#pragma omp parallel reduction(+:score_sum) reduction(|:allocation_failed)
         {
-            int16_t *prev = (int16_t*)_aligned_malloc((size_t)(max_m + 1) * sizeof(int16_t), 64);
-            int16_t *cur  = (int16_t*)_aligned_malloc((size_t)(max_m + 1) * sizeof(int16_t), 64);
+            int16_t *prev = (int16_t*)aligned_allocate(row_capacity * sizeof(int16_t), 64);
+            int16_t *cur  = (int16_t*)aligned_allocate(row_capacity * sizeof(int16_t), 64);
+            if (!prev || !cur) allocation_failed = 1;
 
-#pragma omp for schedule(dynamic,1)
+#pragma omp for schedule(dynamic,chunk_size)
             for (int i = 0; i < npairs; ++i) {
-                int m = (int)strlen(pairs[i].b);
-                int sc = smith_waterman_score_fast(
-                    pairs[i].a, pairs[i].b,
-                    2, -2, -1,
-                    prev, cur, m
-                );
-                score_sum += sc;
+                if (prev && cur) {
+                    int m = (int)strlen(pairs[i].b);
+                    int sc = smith_waterman_score_fast(
+                        pairs[i].a, pairs[i].b,
+                        2, -2, -1,
+                        prev, cur, m
+                    );
+                    score_sum += sc;
+                }
             }
 
-            _aligned_free(prev);
-            _aligned_free(cur);
+            aligned_release(prev);
+            aligned_release(cur);
         }
 #else
-        int16_t *prev = (int16_t*)_aligned_malloc((size_t)(max_m + 1) * sizeof(int16_t), 64);
-        int16_t *cur  = (int16_t*)_aligned_malloc((size_t)(max_m + 1) * sizeof(int16_t), 64);
+    int16_t *prev = (int16_t*)aligned_allocate(row_capacity * sizeof(int16_t), 64);
+    int16_t *cur = (int16_t*)aligned_allocate(row_capacity * sizeof(int16_t), 64);
+    if (!prev || !cur) {
+        fprintf(stderr, "Error: unable to allocate DP rows\n");
+        aligned_release(prev);
+        aligned_release(cur);
+        return 1;
+    }
+    for (int i = 0; i < npairs; ++i) {
+        int m = (int)strlen(pairs[i].b);
+        int sc = smith_waterman_score_fast(
+            pairs[i].a, pairs[i].b,
+            2, -2, -1,
+            prev, cur, m
+        );
+        score_sum += sc;
+    }
 
-        for (int i = 0; i < npairs; ++i) {
-            int m = (int)strlen(pairs[i].b);
-            int sc = smith_waterman_score_fast(
-                pairs[i].a, pairs[i].b,
-                2, -2, -1,
-                prev, cur, m
-            );
-            score_sum += sc;
-        }
-
-        _aligned_free(prev);
-        _aligned_free(cur);
+    aligned_release(prev);
+    aligned_release(cur);
 #endif
 
-        double t1 = walltime_seconds();
-        double elapsed = t1 - t0;
-
-        if (c == 0) baseline_time = elapsed;
-        double speedup = (baseline_time > 0.0) ? (baseline_time / elapsed) : 1.0;
-
-        printf("threads=%2d  pairs=%d  time=%.6f  score_sum=%lld  speedup=%.3f\n",
-               threads, npairs, elapsed, score_sum, speedup);
+    if (allocation_failed) {
+        fprintf(stderr, "Error: unable to allocate DP rows for all OpenMP threads\n");
+        return 1;
     }
+
+    double elapsed = walltime_seconds() - t0;
+    printf("threads=%d  chunk=%d  pairs=%d  time=%.6f  score_sum=%lld\n",
+           threads, chunk_size, npairs, elapsed, score_sum);
 
     // cleanup
     for (int i = 0; i < npairs; ++i) {

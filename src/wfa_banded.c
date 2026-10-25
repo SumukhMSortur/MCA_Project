@@ -1,8 +1,12 @@
+#if !defined(_WIN32) && !defined(_WIN64)
+#define _POSIX_C_SOURCE 200112L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <malloc.h>
+#include <limits.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -11,11 +15,39 @@
 #if defined(_WIN32) || defined(_WIN64)
 #define WINDOWS 1
 #include <windows.h>
+#include <malloc.h>
 #else
 #define WINDOWS 0
 #include <time.h>
 #include <sys/time.h>
 #endif
+
+static void *aligned_allocate(size_t size, size_t alignment) {
+#if WINDOWS
+    return _aligned_malloc(size, alignment);
+#else
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
+    return ptr;
+#endif
+}
+
+static void aligned_release(void *ptr) {
+#if WINDOWS
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+static int parse_int(const char *text, int minimum, int *value) {
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (text == end || *end != '\0' || parsed < minimum || parsed > INT_MAX)
+        return 0;
+    *value = (int)parsed;
+    return 1;
+}
 
 #define NEG_INF_16 ((int16_t)-30000)
 
@@ -217,17 +249,30 @@ static int banded_score_fast(
 }
 
 // --------------------------------------------------------
-// MAIN: automatic thread benchmark
+// MAIN: one harness-controlled benchmark configuration
 // --------------------------------------------------------
 int main(int argc,char **argv){
-    if(argc<3){
-        fprintf(stderr,"Usage: %s pairs.fa <band>\n",argv[0]);
+    int band = 0;
+    int threads = 1;
+    int chunk_size = 1;
+    if(argc < 3 || argc > 5 ||
+       !parse_int(argv[2], 0, &band) ||
+       (argc >= 4 && !parse_int(argv[3], 1, &threads)) ||
+       (argc >= 5 && !parse_int(argv[4], 1, &chunk_size))){
+        fprintf(stderr,"Usage: %s pairs.fa band [threads [schedule_chunk]]\n",argv[0]);
         return 1;
     }
 
     const char *fname = argv[1];
-    int band = atoi(argv[2]);
-    if(band<0) band=0;
+#ifndef _OPENMP
+    if(threads > 1){
+        fprintf(stderr,"This binary was built without OpenMP; rebuild with -fopenmp\n");
+        return 1;
+    }
+#else
+    omp_set_dynamic(0);
+    omp_set_num_threads(threads);
+#endif
 
     int npairs = 0;
     Pair *pairs = read_pairs(fname,&npairs);
@@ -236,77 +281,69 @@ int main(int argc,char **argv){
         return 1;
     }
 
-    int W = 2*band + 1;
-    if(W <= 0){
-        fprintf(stderr,"Band too small\n");
+    if(band > (INT_MAX - 1) / 2){
+        fprintf(stderr,"Band is too large\n");
+        return 1;
+    }
+    int W = 2 * band + 1;
+    size_t row_capacity = ((size_t)W + 15) / 16 * 16;
+    long long score_sum = 0;
+    int allocation_failed = 0;
+    double t0 = walltime_seconds();
+
+#ifdef _OPENMP
+#pragma omp parallel reduction(+:score_sum) reduction(|:allocation_failed)
+        {
+            int16_t *prev = (int16_t*)aligned_allocate(row_capacity*sizeof(int16_t),64);
+            int16_t *cur = (int16_t*)aligned_allocate(row_capacity*sizeof(int16_t),64);
+            if(!prev || !cur) allocation_failed = 1;
+
+#pragma omp for schedule(dynamic,chunk_size)
+            for(int i=0;i<npairs;i++){
+                if(prev && cur){
+                    int sc = banded_score_fast(
+                        pairs[i].a, pairs[i].b,
+                        band,
+                        2, -2, -1,
+                        prev, cur, W
+                    );
+                    score_sum += sc;
+                }
+            }
+
+            aligned_release(prev);
+            aligned_release(cur);
+        }
+#else
+    int16_t *prev = (int16_t*)aligned_allocate(row_capacity*sizeof(int16_t),64);
+    int16_t *cur = (int16_t*)aligned_allocate(row_capacity*sizeof(int16_t),64);
+    if(!prev || !cur){
+        fprintf(stderr,"Error: unable to allocate DP rows\n");
+        aligned_release(prev);
+        aligned_release(cur);
+        return 1;
+    }
+    for(int i=0;i<npairs;i++){
+        int sc = banded_score_fast(
+            pairs[i].a, pairs[i].b,
+            band,
+            2, -2, -1,
+            prev, cur, W
+        );
+        score_sum += sc;
+    }
+    aligned_release(prev);
+    aligned_release(cur);
+#endif
+
+    if(allocation_failed){
+        fprintf(stderr,"Error: unable to allocate DP rows for all OpenMP threads\n");
         return 1;
     }
 
-    int thread_list[] = {1,2,4,8,16};
-    int nconfigs = sizeof(thread_list)/sizeof(thread_list[0]);
-
-    printf("=== WFA/Banded DP Auto Benchmark ===\n");
-    printf("Dataset: %s  (pairs=%d, band=%d, W=%d)\n\n", fname, npairs, band, W);
-
-    double baseline_time = 0.0;
-
-    for(int c=0;c<nconfigs;c++){
-        int threads = thread_list[c];
-
-#ifdef _OPENMP
-        omp_set_num_threads(threads);
-#endif
-
-        long long score_sum = 0;
-        double t0 = walltime_seconds();
-
-#ifdef _OPENMP
-#pragma omp parallel reduction(+:score_sum)
-        {
-            int16_t *prev = (int16_t*)_aligned_malloc((size_t)W*sizeof(int16_t),64);
-            int16_t *cur  = (int16_t*)_aligned_malloc((size_t)W*sizeof(int16_t),64);
-
-#pragma omp for schedule(dynamic,1)
-            for(int i=0;i<npairs;i++){
-                int sc = banded_score_fast(
-                    pairs[i].a, pairs[i].b,
-                    band,
-                    2, -2, -1,
-                    prev, cur, W
-                );
-                score_sum += sc;
-            }
-
-            _aligned_free(prev);
-            _aligned_free(cur);
-        }
-#else
-        int16_t *prev = (int16_t*)_aligned_malloc((size_t)W*sizeof(int16_t),64);
-        int16_t *cur  = (int16_t*)_aligned_malloc((size_t)W*sizeof(int16_t),64);
-
-        for(int i=0;i<npairs;i++){
-            int sc = banded_score_fast(
-                pairs[i].a, pairs[i].b,
-                band,
-                2, -2, -1,
-                prev, cur, W
-            );
-            score_sum += sc;
-        }
-
-        _aligned_free(prev);
-        _aligned_free(cur);
-#endif
-
-        double t1 = walltime_seconds();
-        double elapsed = t1 - t0;
-
-        if(c==0) baseline_time = elapsed;
-        double speedup = (baseline_time>0.0) ? (baseline_time/elapsed) : 1.0;
-
-        printf("threads=%2d  pairs=%d  time=%.6f  score_sum=%lld  speedup=%.3f\n",
-               threads, npairs, elapsed, score_sum, speedup);
-    }
+    double elapsed = walltime_seconds() - t0;
+    printf("threads=%d  chunk=%d  pairs=%d  band=%d  time=%.6f  score_sum=%lld\n",
+           threads, chunk_size, npairs, band, elapsed, score_sum);
 
     for(int i=0;i<npairs;i++){
         free(pairs[i].a);

@@ -131,6 +131,103 @@ def plot_runtime_vs_identity_per_length():
 
 
 # ==========================================================
+# 5) SPEEDUP BY AFFINITY PROFILE AND DYNAMIC CHUNK
+# ==========================================================
+def plot_affinity_speedup():
+    required = {"affinity", "schedule_chunk"}
+    if not required.issubset(df.columns):
+        print("[skip] Affinity speedup columns are not present; rerun the updated harness")
+        return
+
+    lengths = sorted(df["length"].unique())
+    identities = sorted(df["identity"].unique())
+
+    for length in lengths:
+        for identity in identities:
+            subset = df[(df["length"] == length) & (df["identity"] == identity)]
+            if subset.empty:
+                continue
+            plt.figure(figsize=(12, 7))
+
+            for (binary, affinity, chunk), group in subset.groupby(
+                ["binary", "affinity", "schedule_chunk"]
+            ):
+                baseline = group.loc[group["threads"] == 1, "median_time"]
+                if baseline.empty or baseline.iloc[0] <= 0:
+                    continue
+                group = group.sort_values("threads")
+                speedup = baseline.iloc[0] / group["median_time"]
+                plt.plot(
+                    group["threads"], speedup, marker="o",
+                    label=f"{binary}, {affinity}, chunk={chunk}"
+                )
+
+            max_threads = int(subset["threads"].max())
+            plt.plot(
+                [1, max_threads], [1, max_threads], linestyle="--",
+                color="gray", label="Ideal linear speedup"
+            )
+            plt.title(
+                f"Batch alignment speedup (length={length}, identity={identity:.2f})"
+            )
+            plt.xlabel("Threads")
+            plt.ylabel("Speedup vs. one thread")
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+
+            out = f"speedup_affinity_length{length}_id{int(identity * 100)}.png"
+            plt.savefig(out, dpi=300, bbox_inches="tight")
+            plt.close()
+            print(f"[✔] Saved: {out}")
+
+
+# ==========================================================
+# 6) PERF METRICS — IPC AND L1 DATA-CACHE MISSES
+# ==========================================================
+def plot_perf_metrics():
+    metric_columns = {"median_ipc", "median_l1_dcache_load_misses"}
+    if not metric_columns.issubset(df.columns):
+        print("[skip] Hardware counters are not present; run the harness with --perf")
+        return
+
+    if df["median_ipc"].notna().any():
+        plt.figure(figsize=(12, 7))
+        sns.lineplot(
+            data=df,
+            x="threads",
+            y="median_ipc",
+            hue="affinity" if "affinity" in df.columns else "binary",
+            style="binary",
+            marker="o"
+        )
+        plt.title("Instruction per cycle by thread count")
+        plt.xlabel("Threads")
+        plt.ylabel("Median IPC")
+        out = "ipc_vs_threads.png"
+        plt.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"[✔] Saved: {out}")
+
+    if df["median_l1_dcache_load_misses"].notna().any():
+        plt.figure(figsize=(12, 7))
+        sns.lineplot(
+            data=df,
+            x="threads",
+            y="median_l1_dcache_load_misses",
+            hue="affinity" if "affinity" in df.columns else "binary",
+            style="binary",
+            marker="o"
+        )
+        plt.title("L1 data-cache load misses by thread count")
+        plt.xlabel("Threads")
+        plt.ylabel("Median L1 data-cache load misses")
+        out = "l1_dcache_misses_vs_threads.png"
+        plt.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"[✔] Saved: {out}")
+
+
+# ==========================================================
 # MAIN FUNCTION — RUN EVERYTHING
 # ==========================================================
 if __name__ == "__main__":
@@ -141,14 +238,14 @@ if __name__ == "__main__":
 
     plot_runtime_vs_identity_overall()
     plot_runtime_vs_identity_per_length()
+    plot_affinity_speedup()
+    plot_perf_metrics()
 
     print("\n=== All plots generated successfully! ===\n")
     plot_runtime_vs_identity_overall()
     plot_runtime_vs_identity_per_length()
 
     print("\n=== All plots generated successfully! ===\n")
-
-
 
 
 
